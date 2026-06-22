@@ -1,0 +1,93 @@
+{
+  "title": "Distributed Task Queue",
+  "uid": "distributed-task-queue",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Queue Depths",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "queue_depth", "legendFormat": "main queue" },
+        { "expr": "queue_inflight_depth", "legendFormat": "inflight" },
+        { "expr": "queue_delayed_depth", "legendFormat": "delayed (retry-scheduled)" },
+        { "expr": "queue_dlq_depth", "legendFormat": "dead letter queue" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Task Throughput (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "rate(queue_tasks_enqueued_total[1m])", "legendFormat": "enqueued" },
+        { "expr": "rate(queue_tasks_consumed_total[1m])", "legendFormat": "consumed" },
+        { "expr": "rate(queue_tasks_acknowledged_total[1m])", "legendFormat": "acknowledged" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Retries / Dead-Letters / Sweeps (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "rate(queue_tasks_retried_total[1m])", "legendFormat": "retried" },
+        { "expr": "rate(queue_tasks_dead_lettered_total[1m])", "legendFormat": "dead-lettered" },
+        { "expr": "rate(queue_tasks_swept_total[1m])", "legendFormat": "swept by janitor" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Store Errors by Operation (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum by (operation) (rate(queue_store_errors_total[1m]))", "legendFormat": "{{operation}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Processing Failure Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "rate(queue_processing_failures_total[1m])", "legendFormat": "processing failures/sec" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Processing Duration (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(queue_processing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(queue_processing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(queue_processing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "DLQ Depth (current)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 24 },
+      "targets": [{ "expr": "queue_dlq_depth" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

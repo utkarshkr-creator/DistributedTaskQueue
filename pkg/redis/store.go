@@ -2,6 +2,8 @@ package redis
 
 import (
 	"context"
+	"distributed-queue/pkg/config"
+	"distributed-queue/pkg/redis/metrics"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -15,7 +17,7 @@ type RedisStore struct {
 	holdTTL time.Duration
 }
 
-func NewRedisStore(ctx context.Context, cfg Config, holdTTL time.Duration) (*RedisStore, error) {
+func NewRedisStore(ctx context.Context, cfg config.RedisConfig, holdTTL time.Duration) (*RedisStore, error) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Address,
 		Password: cfg.Password,
@@ -40,8 +42,10 @@ func (s *RedisStore) Close() error {
 func (s *RedisStore) EnqueueTask(ctx context.Context, queueName string, taskId string) error {
 	err := s.rdb.LPush(ctx, queueName, taskId).Err()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "EnqueueTask").Inc()
 		return fmt.Errorf("[PRODUCER] failed to enqueue task %s: %w", taskId, err)
 	}
+	metrics.TasksEnqueued.WithLabelValues(queueName).Inc()
 	return nil
 }
 
@@ -60,6 +64,7 @@ func (s *RedisStore) ConsumeTask(ctx context.Context, queueName string) (string,
 		return "", nil // No task available
 	}
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "ConsumeTask").Inc()
 		return "", fmt.Errorf("[CONSUMER] failed to consume task via blmove: %w", err)
 	}
 
@@ -67,12 +72,15 @@ func (s *RedisStore) ConsumeTask(ctx context.Context, queueName string) (string,
 	// between machines.
 	redisTime, err := s.rdb.Time(ctx).Result()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "ConsumeTask").Inc()
 		slog.Error("[CONSUMER] failed to get Redis server time, returning task without inflight tracking", "taskId", taskId, "error", err)
+		metrics.TasksConsumed.WithLabelValues(queueName).Inc()
 		return taskId, nil
 	}
 	now := redisTime.Unix()
 
 	if err := s.rdb.HSet(ctx, timeHashKey, taskId, strconv.FormatInt(now, 10)).Err(); err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "ConsumeTask").Inc()
 		slog.Error("[CONSUMER] failed to record inflight timestamp, returning task to queue", "taskId", taskId, "error", err)
 		pipe := s.rdb.TxPipeline()
 		pipe.LRem(ctx, inflightKey, 1, taskId)
@@ -81,11 +89,13 @@ func (s *RedisStore) ConsumeTask(ctx context.Context, queueName string) (string,
 			// Worst case: task stays in inflight untracked. Surface this loudly
 			// since it will require manual intervention or rely on a
 			// time-based reconciliation job to recover.
+			metrics.StoreErrors.WithLabelValues(queueName, "ConsumeTask").Inc()
 			return "", fmt.Errorf("[CONSUMER] failed to record timestamp AND failed to requeue task %s, task is now untracked in inflight: %w", taskId, rerr)
 		}
 		return "", nil
 	}
 
+	metrics.TasksConsumed.WithLabelValues(queueName).Inc()
 	return taskId, nil
 }
 
@@ -99,6 +109,7 @@ func (s *RedisStore) AcknowledgeTask(ctx context.Context, queueName string, task
 	pipe.HDel(ctx, timeHashKey, taskId)
 	pipe.HDel(ctx, retryHashKey, taskId)
 	if _, err := pipe.Exec(ctx); err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "AcknowledgeTask").Inc()
 		return fmt.Errorf("[ACK] failed to acknowledge task %s: %w", taskId, err)
 	}
 	if removed.Val() == 0 {
@@ -106,6 +117,7 @@ func (s *RedisStore) AcknowledgeTask(ctx context.Context, queueName string, task
 		// moved this task back to the main queue) but worth knowing about.
 		slog.Warn("[ACK] task was not found in inflight list when acknowledged", "taskId", taskId)
 	}
+	metrics.TasksAcknowledged.WithLabelValues(queueName).Inc()
 	return nil
 }
 
@@ -118,6 +130,7 @@ func (s *RedisStore) GetAndIncrementRetryCount(ctx context.Context, queueName, t
 
 	prior, err := s.rdb.HGet(ctx, retryHashKey, taskId).Result()
 	if err != nil && err != redis.Nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "GetAndIncrementRetryCount").Inc()
 		return 0, fmt.Errorf("[RETRY] failed to read retry count for task %s: %w", taskId, err)
 	}
 	count := 0
@@ -130,6 +143,7 @@ func (s *RedisStore) GetAndIncrementRetryCount(ctx context.Context, queueName, t
 	}
 
 	if err := s.rdb.HSet(ctx, retryHashKey, taskId, strconv.Itoa(count+1)).Err(); err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "GetAndIncrementRetryCount").Inc()
 		return count, fmt.Errorf("[RETRY] failed to persist incremented retry count for task %s: %w", taskId, err)
 	}
 	return count, nil
@@ -141,10 +155,12 @@ func (s *RedisStore) SweepAbondonedTasks(ctx context.Context, queueName string) 
 
 	timestamps, err := s.rdb.HGetAll(ctx, timeHashKey).Result()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "SweepAbondonedTasks").Inc()
 		return fmt.Errorf("[JANITOR] failed to get task timestamps: %w", err)
 	}
 	redisTime, err := s.rdb.Time(ctx).Result()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "SweepAbondonedTasks").Inc()
 		return fmt.Errorf("[JANITOR] failed to get Redis server time: %w", err)
 	}
 	now := redisTime.Unix()
@@ -161,6 +177,7 @@ func (s *RedisStore) SweepAbondonedTasks(ctx context.Context, queueName string) 
 			pipe.HDel(ctx, timeHashKey, taskId)
 			pipe.LPush(ctx, queueName, taskId)
 			if _, err := pipe.Exec(ctx); err != nil {
+				metrics.StoreErrors.WithLabelValues(queueName, "SweepAbondonedTasks").Inc()
 				return fmt.Errorf("[JANITOR] failed to sweep abandoned task %s: %w", taskId, err)
 			}
 			if removed.Val() == 0 {
@@ -170,6 +187,7 @@ func (s *RedisStore) SweepAbondonedTasks(ctx context.Context, queueName string) 
 				// happens.
 				slog.Warn("[JANITOR] requeued task that was not present in inflight list, possible duplicate", "taskId", taskId)
 			}
+			metrics.TasksSwept.WithLabelValues(queueName).Inc()
 		}
 	}
 	return nil
@@ -182,6 +200,7 @@ func (s *RedisStore) RetryTaskWithBackoff(ctx context.Context, queueName string,
 
 	redisTime, err := s.rdb.Time(ctx).Result()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "RetryTaskWithBackoff").Inc()
 		return fmt.Errorf("[PRODUCER] failed to get central clock time: %w", err)
 	}
 
@@ -199,12 +218,14 @@ func (s *RedisStore) RetryTaskWithBackoff(ctx context.Context, queueName string,
 	})
 
 	if _, err = pipe.Exec(ctx); err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "RetryTaskWithBackoff").Inc()
 		return fmt.Errorf("[PRODUCER] failed to move task %s to retry queue: %w", taskId, err)
 	}
 	if removed.Val() == 0 {
 		slog.Warn("[PRODUCER] retried task was not present in inflight list", "taskId", taskId)
 	}
 
+	metrics.TasksRetried.WithLabelValues(queueName).Inc()
 	slog.Info("[PRODUCER] task moved to retry queue with backoff", "taskId", taskId, "retryCount", currentRetry, "delaySeconds", delayInSec)
 	return nil
 }
@@ -222,12 +243,52 @@ func (s *RedisStore) MoveToDeadLetterQueue(ctx context.Context, queueName, taskI
 	pipe.LPush(ctx, dlqKey, taskId)
 
 	if _, err := pipe.Exec(ctx); err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "MoveToDeadLetterQueue").Inc()
 		return fmt.Errorf("[DLQ] failed to move task %s to dead letter queue: %w", taskId, err)
 	}
 	if removed.Val() == 0 {
 		slog.Warn("[DLQ] dead-lettered task was not present in inflight list", "taskId", taskId)
 	}
+	metrics.TasksDeadLettered.WithLabelValues(queueName).Inc()
 	slog.Info("[DLQ] task moved to dead letter queue after max retries", "taskId", taskId)
+	return nil
+}
+
+// CollectDepths reads the current size of each queue-related Redis
+// structure and updates the corresponding Prometheus gauges. Intended to be
+// called periodically (e.g. every few seconds) by a dedicated goroutine —
+// gauges reflect a snapshot of Redis state, not a discrete code event, so
+// they can't be updated inline at the point of an operation.
+func (s *RedisStore) CollectDepths(ctx context.Context, queueName string) error {
+	inflightKey := queueName + ":inflight"
+	delayedKey := queueName + ":delayed"
+	dlqKey := queueName + ":dlq"
+
+	queueLen, err := s.rdb.LLen(ctx, queueName).Result()
+	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "CollectDepths").Inc()
+		return fmt.Errorf("[METRICS] failed to read queue depth: %w", err)
+	}
+	inflightLen, err := s.rdb.LLen(ctx, inflightKey).Result()
+	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "CollectDepths").Inc()
+		return fmt.Errorf("[METRICS] failed to read inflight depth: %w", err)
+	}
+	delayedLen, err := s.rdb.ZCard(ctx, delayedKey).Result()
+	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "CollectDepths").Inc()
+		return fmt.Errorf("[METRICS] failed to read delayed depth: %w", err)
+	}
+	dlqLen, err := s.rdb.LLen(ctx, dlqKey).Result()
+	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "CollectDepths").Inc()
+		return fmt.Errorf("[METRICS] failed to read DLQ depth: %w", err)
+	}
+
+	metrics.QueueDepth.WithLabelValues(queueName).Set(float64(queueLen))
+	metrics.InflightDepth.WithLabelValues(queueName).Set(float64(inflightLen))
+	metrics.DelayedDepth.WithLabelValues(queueName).Set(float64(delayedLen))
+	metrics.DLQDepth.WithLabelValues(queueName).Set(float64(dlqLen))
 	return nil
 }
 
@@ -238,6 +299,7 @@ func (s *RedisStore) PolledDelayedTasks(ctx context.Context, queueName string) e
 
 	redisTime, err := s.rdb.Time(ctx).Result()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "PolledDelayedTasks").Inc()
 		return fmt.Errorf("[PRODUCER] failed to get central clock time: %w", err)
 	}
 	now := redisTime.Unix()
@@ -252,6 +314,7 @@ func (s *RedisStore) PolledDelayedTasks(ctx context.Context, queueName string) e
 
 	maturedTasks, err := s.rdb.ZRangeArgs(ctx, opt).Result()
 	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "PolledDelayedTasks").Inc()
 		return fmt.Errorf("[PRODUCER] failed to poll delayed tasks: %w", err)
 	}
 
@@ -267,6 +330,7 @@ func (s *RedisStore) PolledDelayedTasks(ctx context.Context, queueName string) e
 		// ZRangeArgs score bound is unrelated to this race.
 		removed, err := s.rdb.ZRem(ctx, delayedKey, taskId).Result()
 		if err != nil {
+			metrics.StoreErrors.WithLabelValues(queueName, "PolledDelayedTasks").Inc()
 			return fmt.Errorf("[PRODUCER] failed to remove matured task %s from delayed set: %w", taskId, err)
 		}
 		if removed == 0 {
@@ -276,6 +340,7 @@ func (s *RedisStore) PolledDelayedTasks(ctx context.Context, queueName string) e
 		}
 
 		if err := s.rdb.LPush(ctx, queueName, taskId).Err(); err != nil {
+			metrics.StoreErrors.WithLabelValues(queueName, "PolledDelayedTasks").Inc()
 			// We've already removed the task from the delayed set, so on
 			// failure here it would be lost rather than just duplicated.
 			// Put it back into the delayed set at its original due time so

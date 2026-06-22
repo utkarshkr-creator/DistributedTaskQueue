@@ -1,0 +1,65 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: queue-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  queue-app:
+    build:
+      context: ..        # repo root — adjust if this compose file isn't one level below your module root
+      dockerfile: deploy/Dockerfile  # adjust path to wherever you place this Dockerfile
+    container_name: queue-app
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # NOTE: these env var names are a guess — I haven't seen redis.LoadConfig().
+      # Match these to whatever that function actually reads (likely via
+      # os.Getenv or a library like envconfig/viper), then this is the one
+      # place you'd need to edit if names differ.
+      REDIS_ADDRESS: "redis:6379"
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+    ports:
+      - "9090:9090"   # /metrics endpoint
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: queue-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9091:9090"   # host 9091 -> avoid clashing with queue-app's own 9090
+    depends_on:
+      - queue-app
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: queue-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin   # change before any real use
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:
