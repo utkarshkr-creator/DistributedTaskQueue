@@ -30,12 +30,18 @@ func simulateProcessing(ctx context.Context, taskId string) error {
 		return ctx.Err()
 	case <-time.After(2 * time.Second):
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if rand.Intn(5) == 0 {
 		return errors.New("simulated processing failure")
 	}
 	return nil
 }
 
+// runWorker continuously consumes tasks from Redis, checks idempotency in Postgres,
+// processes them, and updates Postgres and Redis accordingly. It handles retries
+// and dead-lettering based on the Postgres job row's retry counter.
 func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("worker thread started, waiting for tasks...")
@@ -53,6 +59,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 				return
 			}
 			slog.Error("failed to consume task", "error", err)
+			//TODO: Implement exponential backoff here instead of busy-looping on Redis errors
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -98,6 +105,8 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 			if err := jobRepo.CompleteJob(ctx, queueName, taskId); err != nil {
 				slog.Error("failed to write job completion to postgres, leaving for janitor to recover", "taskId", taskId, "error", err)
+				//TODO: Implement exponential backoff here instead of busy-looping on DB errors
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
@@ -119,6 +128,8 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 			if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
 				slog.Error("failed to acknowledge task, will be recovered by janitor", "taskId", taskId, "error", err)
+				//TODO: Implement exponential backoff here instead of busy-looping on Redis errors
+				time.Sleep(500 * time.Millisecond) // avoid busy-looping on Redis errors
 			} else {
 				slog.Info("task acknowledged and synchronized everywhere", "taskId", taskId)
 			}
@@ -133,11 +144,19 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 		currentRetry, maxRetry, dbErr := jobRepo.RecordFailure(ctx, queueName, taskId, procErr.Error())
 		if dbErr != nil {
 			slog.Error("failed to record failure in postgres, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
+			//TODO: Implement exponential backoff here instead of busy-looping on DB errors
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
 		if currentRetry >= maxRetry {
 			slog.Error("task exceeded max retries, moving to DLQ", "taskId", taskId, "retries", currentRetry, "maxRetries", maxRetry)
+
+			// Cancel all dependent children since this parent will never complete
+			if err := jobRepo.MarkAsCancelledCascading(ctx, queueName, taskId); err != nil {
+				slog.Error("failed to cascade cancellation to children", "taskId", taskId, "error", err)
+			}
+
 			if err := store.MoveToDeadLetterQueue(ctx, queueName, taskId); err != nil {
 				slog.Error("failed to move task to DLQ, leaving for janitor to recover", "taskId", taskId, "error", err)
 			}
@@ -151,6 +170,8 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 	}
 }
 
+// ranProducer generates tasks at a fixed interval, creating a workflow and jobs in Postgres, then enqueuing them to Redis.
+// It simulates a task producer for demonstration purposes.
 func runProducer(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("producer thread started, generating tasks...")
@@ -199,6 +220,7 @@ func runProducer(ctx context.Context, queueName string, store *redis.RedisStore,
 	}
 }
 
+// ranJanitor periodically checks for tasks that have been inflight longer than holdTTL and moves them back to the main queue for retry.
 func runJanitor(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("janitor thread started, monitoring for abandoned tasks...")
@@ -221,6 +243,7 @@ func runJanitor(ctx context.Context, queueName string, interval time.Duration, s
 	}
 }
 
+// runDelayedPoller periodically checks the delayed queue for tasks whose delay has expired and moves them to the main queue.
 func runDelayedPoller(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("delayed-task poller started")

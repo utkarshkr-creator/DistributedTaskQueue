@@ -305,3 +305,51 @@ func (r *JobRepository) CheckAndEnqueueChildren(ctx context.Context, queueName, 
 
 	return readyChildren, rows.Err()
 }
+
+// MarkAsCancelledCascading recursively cancels all descendant tasks when a
+// parent fails. This enforces strict topological ordering: if any required
+// parent fails, all downstream tasks are blocked and should be cancelled.
+//
+// For DAGs with multiple parents (AND semantics): if ANY parent fails, children
+// cannot run because they need outputs from ALL parents.
+func (r *JobRepository) MarkAsCancelledCascading(ctx context.Context, queueName, failedTaskID string) error {
+	id, err := uuid.Parse(failedTaskID)
+	if err != nil {
+		return fmt.Errorf("taskID %q is not a valid UUID: %w", failedTaskID, err)
+	}
+
+	// Recursively find and cancel all descendants of the failed task
+	query := `
+		WITH RECURSIVE descendants AS (
+			-- Base case: direct children of failed task
+			SELECT child_job_id
+			FROM job_dependencies
+			WHERE parent_job_id = $1
+			
+			UNION ALL
+			
+			-- Recursive case: children of children
+			SELECT jd.child_job_id
+			FROM job_dependencies jd
+			INNER JOIN descendants d ON jd.parent_job_id = d.child_job_id
+		)
+		CYCLE child_job_id USING path
+		UPDATE processed_jobs
+		SET status = $2
+		WHERE id IN (SELECT child_job_id FROM descendants)
+		  AND status IN ($3, $4);  -- Only cancel PENDING/RUNNING
+	`
+
+	tag, err := r.pool.Exec(ctx, query, id, StatusCancelled, StatusPending, StatusRunning)
+	if err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "MarkAsCancelledCascading").Inc()
+		return fmt.Errorf("failed to mark descendants as CANCELLED: %w", err)
+	}
+
+	cancelled := tag.RowsAffected()
+	if cancelled > 0 {
+		metrics.TasksCancelledCascade.WithLabelValues(queueName).Add(float64(cancelled))
+		slog.Warn("[CASCADE] cancelled all descendants of failed parent", "parentId", failedTaskID, "cancelledCount", cancelled)
+	}
+	return nil
+}

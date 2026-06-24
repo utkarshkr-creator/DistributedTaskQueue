@@ -159,4 +159,11 @@ var (
 		Name: "queue_workflows_created_total",
 		Help: "Total workflows created.",
 	})
+
+	// TasksCancelledCascade counts tasks cancelled due to parent failure.
+	// High values indicate many blocked DAG branches.
+	TasksCancelledCascade = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "queue_tasks_cancelled_cascade_total",
+		Help: "Total tasks cancelled due to parent task failure (cascading cancellation).",
+	}, []string{"queue"})
 )
